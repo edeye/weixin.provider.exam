@@ -1,0 +1,341 @@
+package com.project.edeyeDemo.controller;
+
+import com.alibaba.fastjson.JSON;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.common.model.Enp;
+import com.common.util.common.DateUtil;
+import com.common.util.common.IdUtil;
+import com.common.util.project.PU;
+import com.mybatis.entity.WxDutyTextmsgAutoReplyEntity;
+import com.mybatis.entity.WxUseridOriginidEntity;
+import com.mybatis.service.WxDutyTextmsgAutoReplyService;
+import com.mybatis.service.WxDutyTextmsgAutoReplyServiceImpl;
+import com.mybatis.service.WxUseridOriginidService;
+import com.mybatis.service.WxUseridOriginidServiceImpl;
+import com.project.edeyeDemo.service.EdeyeDemoService;
+import me.chanjar.weixin.common.error.WxErrorException;
+import me.chanjar.weixin.cp.api.WxCpService;
+import me.chanjar.weixin.cp.api.impl.WxCpServiceImpl;
+import me.chanjar.weixin.cp.bean.WxCpOauth2UserInfo;
+import me.chanjar.weixin.cp.bean.message.WxCpMessage;
+import me.chanjar.weixin.cp.bean.message.WxCpXmlMessage;
+import me.chanjar.weixin.cp.bean.message.WxCpXmlOutMessage;
+import me.chanjar.weixin.cp.bean.message.WxCpXmlOutTextMessage;
+import me.chanjar.weixin.cp.config.impl.WxCpDefaultConfigImpl;
+import me.chanjar.weixin.cp.message.WxCpMessageHandler;
+import me.chanjar.weixin.cp.message.WxCpMessageRouter;
+import me.chanjar.weixin.cp.util.crypto.WxCpCryptUtil;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.ui.Model;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.ModelAndView;
+import org.springframework.web.servlet.view.RedirectView;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.servlet.http.HttpSession;
+import java.io.IOException;
+import java.util.Date;
+import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+@RestController
+@RequestMapping("/edeyeDemo")
+public class EdeyeDemoController {
+
+    protected WxCpDefaultConfigImpl config;
+    protected WxCpService wxCpService;
+    protected WxCpCryptUtil cryptUtil;
+    protected WxCpMessageRouter wxCpMessageRouter;
+    protected Thread queueThread;
+
+    public static ConcurrentLinkedQueue<WxDutyTextmsgAutoReplyEntity> insertQueue = new ConcurrentLinkedQueue<>();
+
+    // 初始化WX配置
+    private void init() {
+        if (config == null) {
+            config = new WxCpDefaultConfigImpl();
+            config.setCorpId("11111111");      // 设置微信企业号的appid
+            config.setAgentId(1000002);     // 设置微信企业号应用ID
+            config.setCorpSecret("aaaaaaa");  // 设置微信企业号的app corpSecret
+            config.setToken("bbbbbbbb");       // 设置微信企业号应用的token
+            config.setAesKey("ccccccccccccccc");      // 设置微信企业号应用的EncodingAESKey
+        }
+        if (wxCpService == null) {
+            wxCpService = new WxCpServiceImpl();
+            wxCpService.setWxCpConfigStorage(config);
+        }
+        if (cryptUtil == null) {
+            cryptUtil = new WxCpCryptUtil(config);
+        }
+        if (wxCpMessageRouter == null) {
+            wxCpMessageRouter = new WxCpMessageRouter(wxCpService);
+
+            WxCpMessageHandler handler = (wxMessage, context, wxCpService, wxSessionManager) -> {
+                WxCpXmlOutTextMessage m = WxCpXmlOutMessage
+                        .TEXT()
+                        .content("测试加密消息")
+                        .fromUser(wxMessage.getToUserName())
+                        .toUser(wxMessage.getFromUserName())
+                        .build();
+                return m;
+            };
+
+            wxCpMessageRouter
+                    .rule()
+                    .async(false)
+                    .content("值班") // 拦截内容为"值班"的消息
+                    .handler(handler)
+                    .end();
+        }
+    }
+
+    // 先进入企业自己的页面,如果未登录跳入login,登录跳入bind或main
+    @RequestMapping("/getWxLoginCheck")
+    public ModelAndView getWxLoginCheck(HttpServletRequest request, HttpServletResponse response, HttpSession session,
+                                        Model model) {
+        response.setHeader("SET-COOKIE", "JSESSIONID=" + session.getId() + "; secure ; HttpOnly");
+        response.setHeader("Cache-Control", "no-cache");
+        response.setHeader("Pragma", "no-cache");
+        response.setDateHeader("expires", -1);
+
+        if (PU.checkLogin("EdeyeDemo")) {
+            // 已登录
+            String userId = session.getAttribute("userId").toString();
+            // 从数据库查询该userId是否绑定了原系统的人员全局唯一ID标识符
+            QueryWrapper<WxUseridOriginidEntity> qw = new QueryWrapper<>();
+            qw.eq("user_id", userId);
+            WxUseridOriginidService wxUseridOriginidService = PU.getBean(WxUseridOriginidServiceImpl.class);
+            WxUseridOriginidEntity obj = wxUseridOriginidService.getOne(qw);
+            boolean bindedFlag = (obj != null);
+
+            if (bindedFlag) {
+                // 已绑定原系统用户信息,进入主页
+                return new ModelAndView(
+                        "/static/weixin/main.html");
+            } else {
+                // 未绑定原系统用户信息,进入绑定页
+                return new ModelAndView(
+                        "/static/weixin/bind.html");
+            }
+
+            // 如果未从数据库中查到userId对应的originId,则跳入一个单独的登录页面,
+            // 如果查到了则直接跳到主页面
+        }
+        // 未登录
+        return new ModelAndView("/static/weixin/login.html");
+    }
+
+    // 在login页面通过ajax调用获取OAuth2链接
+    @RequestMapping({"/getWxOAuth2Url"})
+    public Enp getWxOAuth2Url(HttpServletRequest request, @RequestParam Map<String, String> param) {
+        init();
+        return PU.OK(wxCpService.getOauth2Service().buildAuthorizationUrl("http://test.huike-auto.com/edeyeDemo/WxOAuth2RedirectUrl", "OKOK"));
+    }
+
+    // 用户在login页面点击OAuth2链接后=>经过企业微信服务的处理后=>跳到的后台地址
+    @RequestMapping({"/WxOAuth2RedirectUrl"})
+    public RedirectView WxOAuth2RedirectUrl(HttpServletRequest request, HttpSession session, @RequestParam Map<String, String> param) {
+        init();
+        String code = request.getParameter("code");
+        try {
+            WxCpOauth2UserInfo wxCpOauth2UserInfo = wxCpService.getOauth2Service().getUserInfo(code);
+            System.out.println(JSON.toJSONString(wxCpOauth2UserInfo));
+            // {"deviceId":"aa4a9133b64a7ea439d27b3c9337b3c4","userId":"edeye"}
+            session.setAttribute("EdeyeDemo", Enp.create());
+            session.setAttribute("deviceId", wxCpOauth2UserInfo.getDeviceId());
+            session.setAttribute("userId", wxCpOauth2UserInfo.getUserId());
+
+        } catch (WxErrorException e) {
+            e.printStackTrace();
+        }
+
+        RedirectView redirectTarget = new RedirectView();
+        redirectTarget.setContextRelative(false);
+        redirectTarget.setUrl("/edeyeDemo/getWxLoginCheck");
+        return redirectTarget;
+    }
+
+    // 企业微信userId绑定原系统用户全局唯一ID
+    @RequestMapping("/bingWxUserId")
+    public Enp bingWxUserId(HttpSession session, @RequestParam Map<String, String> param) {
+        String login_name = param.get("login_name");
+        String password = param.get("password");
+        // TODO 为了掩饰效果这里不从数据库取数据校验了,直接写假数据了
+        if ("edeye".equals(login_name) && "123qwe".equals(password)) {
+            String userId = session.getAttribute("userId").toString();
+            String originId = "1988";
+            WxUseridOriginidEntity obj = new WxUseridOriginidEntity().setUserId(userId).setOrginId(originId);
+            WxUseridOriginidService wxUseridOriginidService = PU.getBean(WxUseridOriginidServiceImpl.class);
+            wxUseridOriginidService.save(obj);
+            return PU.OK(null, "绑定成功!");
+        }
+        return PU.OK(null, "绑定失败");
+    }
+
+    // 企业微信收/发送消息
+    @RequestMapping({"/getWxMsg"})
+    public ModelAndView getWxMsg(HttpServletRequest request, HttpServletResponse response, @RequestParam Map<String, String> param) {
+        init();
+        // https://work.weixin.qq.com/wework_admin/frame#apps/modApiApp/5629501103532966
+        // 配置企业微信API接收消息的URL时,会发送以下数据,必须返回正确格式的数据,否则会设置失败
+        // 127.0.0.1=>{"msg_signature":"f0df39f4781e0843c065713eb204ff88963cb00e","timestamp":"1610931725","nonce":"1611172611","echostr":"fFcTZIYJHlfiHXe9ajMfqxN/1H8Kk5xppBXm4+UncEfalZBZTx9+PvznJRYAFZe/VXVNScx8y2AlU/TYtr1FEQ=="}
+        // URL = http://49.233.171.149:2021/edeyeDemo/getWxMsg
+        // Token = y14Pn9kshccYumEnfvB9jffwr1yHO
+        // EncodingAESKey = bkJAsEJ01pBx7uJIayDHpXzSvlWonpFWk5GuzVRPO6U
+        System.out.println(request.getRemoteHost() + "=>" + JSON.toJSONString(param));
+
+        response.setContentType("text/html;charset=utf-8");
+        response.setStatus(HttpServletResponse.SC_OK);
+
+        String msgSignature = request.getParameter("msg_signature");
+        String nonce = request.getParameter("nonce");
+        String timestamp = request.getParameter("timestamp");
+        String echostr = request.getParameter("echostr");
+
+        if (StringUtils.isNotBlank(echostr)) {
+            if (!wxCpService.checkSignature(msgSignature, timestamp, nonce, echostr)) {
+                // 消息签名不正确，说明不是公众平台发过来的消息
+                try {
+                    response.getWriter().println("leagel request");
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+                return null;
+            }
+            // 企业号应用在开启回调模式的时候，会传递加密echostr给服务器，需要解密并echo才能接入成功
+            // 说明是一个仅仅用来验证的请求，回显echostr
+            String plainText = cryptUtil.decrypt(echostr);
+            // System.out.println("plainText = >" + cryptUtil.decrypt(echostr));
+            // plainText = >2047434113264451391
+            try {
+                response.getWriter().println(plainText);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            return null;
+        } else {
+            // 如果没有echostr，则说明传递过来的用户消息，在解密方法里会自动验证消息是否合法
+            try {
+                WxCpXmlMessage inMessage = WxCpXmlMessage.fromEncryptedXml(request.getInputStream(), config, timestamp, nonce, msgSignature);
+                // System.out.println(JSON.toJSONString(inMessage));
+                // {"agentId":"1000002","allFieldsMap":{"Content":"this is a 消息 from PC,","CreateTime":"1610932897","ToUserName":"wwdbf253aaef0c69a2","FromUserName":"edeye","MsgType":"text","AgentID":"1000002","MsgId":"6918904111970008324"},"approvalInfo":{},"content":"this is a 消息 from PC,","createTime":"1610932897","extAttrs":{"items":[]},"fromUserName":"edeye","msgId":"6918904111970008324","msgType":"text","scanCodeInfo":{},"sendLocationInfo":{},"sendPicsInfo":{"picList":[]},"toUserName":"wwdbf253aaef0c69a2"}
+                // 一个消息会发送多个请求,注意企业微信重新发起的请求的msgId是相同的
+
+                if (!"值班".equals(inMessage.getContent())) {
+                    return null;
+                }
+
+                WxDutyTextmsgAutoReplyEntity obj = new WxDutyTextmsgAutoReplyEntity();
+                obj.setId(IdUtil.genSnowflake().toString());
+                obj.setGmtId(obj.getId());
+                obj.setGmtCreate(new Date());
+                obj.setGmtModified(obj.getGmtCreate());
+                obj.setGmtStatus("0");
+                obj.setGmtUser("0");
+                obj.setGmtDes("");
+
+                obj.setContent(inMessage.getContent());
+                obj.setCreateTime(inMessage.getCreateTime().toString());
+                obj.setFromUserName(inMessage.getFromUserName());
+                obj.setMsgId(inMessage.getMsgId().toString());
+                // TODO 回复的消息内容,需要从数据库中查找得到,此处为了方便直接返回一个随机值
+                obj.setRetMsg(DateUtil.getDefaultCurrentDate() + " - 白班(张三,李四),晚班(王五,赵六) - " + System.currentTimeMillis() + "\n"
+                        + "<a href=\"http://test.huike-auto.com/edeyeDemo/getWxLoginCheck\">点击查看近期排班列表</a>");
+                obj.setRowData(JSON.toJSONString(inMessage));
+
+                // 此处为了方便举例使用ConcurrentLinkedQueue队列保存消息,
+                // 并使用一个死循环的线程将ConcurrentLinkedQueue队列里数据保存到数据库和反馈值班信息
+                // 实际项目时将ConcurrentLinkedQueue队列换成MQ/kafka等消息中间件并做专门的处理
+                insertQueue.offer(obj);
+
+                if (queueThread == null || !queueThread.isAlive()) {
+                    queueThread = new Thread(() -> {
+                        while (true) {
+                            WxDutyTextmsgAutoReplyService service = PU.getBean(WxDutyTextmsgAutoReplyServiceImpl.class);
+                            if (service == null) {
+                                try {
+                                    Thread.sleep(100);
+                                } catch (InterruptedException e) {
+                                    e.printStackTrace();
+                                }
+                                continue;
+                            }
+                            WxDutyTextmsgAutoReplyEntity insert = insertQueue.poll();
+                            if (insert == null) {
+                                try {
+                                    Thread.sleep(100);
+                                } catch (InterruptedException e) {
+                                    e.printStackTrace();
+                                }
+                                continue;
+                            }
+
+                            // 已经有此条消息时不能插入重复数据
+                            QueryWrapper<WxDutyTextmsgAutoReplyEntity> qw = new QueryWrapper();
+                            qw.eq("msg_id", insert.getMsgId());
+                            WxDutyTextmsgAutoReplyEntity select = service.getOne(qw);
+                            if (select != null) {
+                                try {
+                                    Thread.sleep(100);
+                                } catch (InterruptedException e) {
+                                    e.printStackTrace();
+                                }
+                                continue;
+                            }
+
+                            // 保存消息
+                            service.save(insert);
+
+                            // 发送消息
+                            try {
+                                WxCpMessage msg = WxCpMessage
+                                        .TEXT()
+                                        .agentId(1000002) // 企业号应用ID
+                                        .toUser(insert.getFromUserName())
+                                        .content(insert.getRetMsg())
+                                        .build();
+                                msg.setEnableIdTrans(false);
+                                msg.setEnableDuplicateCheck(false);
+                                System.out.println(JSON.toJSONString(msg));
+                                wxCpService.getMessageService().send(msg);
+                            } catch (Exception e) {
+                                e.printStackTrace();
+                            }
+
+                            try {
+                                Thread.sleep(100);
+                            } catch (InterruptedException e) {
+                                e.printStackTrace();
+                            }
+                        }
+                    });
+                    queueThread.start();
+                }
+                //
+
+//                WxCpXmlOutMessage outMessage = wxCpMessageRouter.route(inMessage);
+//                if (outMessage != null) {
+//                    System.out.println(JSON.toJSONString(outMessage));
+                // 将需要同步回复的消息加密，然后再返回给微信平台
+//                    System.out.println(outMessage.toEncryptedXml(config));
+//                    <xml>
+//                    <Encrypt><![CDATA[HCXCXc2ehGESy252hxiTQYEtbVrHkQq+t99KyZBMsXnlT5V5tuWdWul8rC0Sk6HWGgHY+SCYXT/4eCPcgu4pWAvYtbzTdFUAoQxi6x0DpdlQl7tyJn1zE0MLkZpHnRQH4q/WxMV8VbbLYg0i4A7wOfA0oxRhurjjd9a/BhitWxnQxonOce+kiAK+fkTC/Y5s3wUpWem9od+htsen1Kh3vhUsEE5lMhz76t4MUw2Qc0c3aLvsERRvQv4a2Ae6ATsnxMnBkkP7/qCFTA3I2ao5a+wsM26eXzhpzpD59Jddhy3Tj1VqoM2kv7tKQY+EVe38ZCPkRAcOIYB48e2g1yVeElLatpvGH0koVcW7Dk7qhwA5iEzMd6TgEJg4Tg7LUlNm]]></Encrypt>
+//                    <MsgSignature><![CDATA[29a491ba8111a7756f806991c0061301481703c7]]></MsgSignature>
+//                    <TimeStamp>1610933361</TimeStamp>
+//                    <Nonce><![CDATA[YUeQiaikBnxJ3UkC]]></Nonce>
+//                    </xml>
+//                    response.getWriter().write(outMessage.toEncryptedXml(config));
+//                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
+        }
+        return null;
+    }
+
+}
